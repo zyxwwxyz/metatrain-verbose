@@ -306,13 +306,13 @@ class PET(ModelInterface[ModelHypers]):
 
         To output the prediction from a single head::
 
-            model.set_uafd_head_weighted_sum(["energy/pbe"])
+            model.set_uafd_head_weighted_sum(["energy/head1"])
 
         To combine several heads with a linear combination (weights may be
         negative, but must sum to 1)::
 
             model.set_uafd_head_weighted_sum(
-                ["energy/pbe", "energy/pbesol"],
+                ["energy/head1", "energy/head2"],
                 weights=torch.tensor([1.4, -0.4]),
             )
 
