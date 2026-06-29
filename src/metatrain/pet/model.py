@@ -277,6 +277,104 @@ class PET(ModelInterface[ModelHypers]):
 
         self.finetune_config: Dict[str, Any] = {}
 
+        # UAFD: optional weighted sum of predictions from a user-specified
+        # subset of target heads for MD inference.  When False (default), the
+        # standard per-architecture behaviour is used.  When True, the model
+        # additionally outputs "energy/weighted_sum" computed as
+        # sum(w_i * head_i) for the configured heads (weights must sum to 1).
+        self.use_uafd_head_weighted_sum: bool = False
+        self.uafd_head_labels: List[str] = []
+        self.uafd_weights_list: List[float] = []
+        self.uafd_head_model_outputs: List[ModelOutput] = []
+
+    def set_uafd_head_weighted_sum(
+        self,
+        head_labels: List[str],
+        weights: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Enable UAFD weighted-sum mode for MD inference.
+
+        When active, calling :meth:`forward` with
+        ``"energy/weighted_sum"`` in the ``outputs`` dict will return
+        the weighted sum of per-atom predictions from the specified target
+        heads, with the autograd graph fully preserved.  All other outputs
+        continue to behave as usual.
+
+        Call this on the Python :class:`PET` object *before* exporting it
+        with :meth:`export`.
+
+        To output the prediction from a single head::
+
+            model.set_uafd_head_weighted_sum(["energy/pbe"])
+
+        To combine several heads with a linear combination (weights may be
+        negative, but must sum to 1)::
+
+            model.set_uafd_head_weighted_sum(
+                ["energy/pbe", "energy/pbesol"],
+                weights=torch.tensor([1.4, -0.4]),
+            )
+
+        :param head_labels: Names of the M target heads to combine.  Each
+            name must appear in the model's training targets.  No duplicates.
+        :param weights: Optional 1-D tensor of length M with real-valued
+            coefficients.  They **must sum to exactly 1**.  If ``None``,
+            equal weights (``1/M`` each) are used.
+        """
+        M = len(head_labels)
+        if M == 0:
+            raise ValueError("head_labels must contain at least one label.")
+        for label in head_labels:
+            if label not in self.target_names:
+                raise ValueError(
+                    f"Head label '{label}' is not a known target. "
+                    f"Known targets: {self.target_names}."
+                )
+        if len(set(head_labels)) != M:
+            raise ValueError("head_labels must not contain duplicate labels.")
+
+        if weights is None:
+            w_float = [1.0 / M for _ in range(M)]
+        else:
+            if weights.shape != (M,):
+                raise ValueError(
+                    f"weights must have shape ({M},), got {tuple(weights.shape)}."
+                )
+            w_sum = float(weights.sum().item())
+            if abs(w_sum - 1.0) > 1e-6:
+                raise ValueError(
+                    f"weights must sum to exactly 1.0 (got {w_sum:.8f}). "
+                    "Normalize your weights before calling this method."
+                )
+            w_float = [float(w) for w in weights.tolist()]
+
+        self.uafd_head_labels = list(head_labels)
+        self.uafd_weights_list = w_float
+        # Store per-atom ModelOutputs so forward() can add them to the outputs
+        # dict without constructing new objects (TorchScript constraint).
+        self.uafd_head_model_outputs = [
+            ModelOutput(
+                quantity=self.outputs[label].quantity,
+                unit=self.outputs[label].unit,
+                sample_kind="atom",
+                description=self.outputs[label].description,
+            )
+            for label in head_labels
+        ]
+        self.use_uafd_head_weighted_sum = True
+
+        # Register the combined output using the first head's metadata.
+        self.outputs["energy/weighted_sum"] = ModelOutput(
+            quantity=self.outputs[head_labels[0]].quantity,
+            unit=self.outputs[head_labels[0]].unit,
+            sample_kind="atom",
+            description=(
+                f"UAFD weighted sum of target heads: {head_labels} "
+                f"with weights {w_float}"
+            ),
+        )
+
     def supported_outputs(self) -> Dict[str, ModelOutput]:
         return self.outputs
 
@@ -448,6 +546,15 @@ class PET(ModelInterface[ModelHypers]):
         device = systems[0].device
         return_dict: Dict[str, TensorMap] = {}
         nl_options = self.requested_neighbor_lists()[0]
+
+        # UAFD: when the weighted-sum output is requested, silently ensure
+        # that each constituent head label is also computed during this pass
+        # (per-atom, so the values can be combined before summing over atoms).
+        if self.use_uafd_head_weighted_sum and "energy/weighted_sum" in outputs:
+            for i in range(len(self.uafd_head_labels)):
+                label = self.uafd_head_labels[i]
+                if label not in outputs:
+                    outputs[label] = self.uafd_head_model_outputs[i]
 
         if self.single_label.values.device != device:
             self._move_labels_to_device(device)
@@ -708,6 +815,46 @@ class PET(ModelInterface[ModelHypers]):
                             self.dataset_info.targets[k].layout,
                             species,
                         )
+
+                # UAFD: compute weighted sum of head predictions.
+                # Individual head labels have already been computed per-atom
+                # (including scaling and additive contributions) earlier in
+                # this block.  We stack their block values, apply the constant
+                # weights, and sum -- exactly equivalent to:
+                #   energies = torch.stack([return_dict[l].block(k).values
+                #                           for l in uafd_head_labels], dim=0)
+                #   total = torch.sum(weights[:, None, ...] * energies, dim=0)
+                # The autograd graph is preserved throughout.
+                if (
+                    self.use_uafd_head_weighted_sum
+                    and "energy/weighted_sum" in outputs
+                ):
+                    ref_label = self.uafd_head_labels[0]
+                    ref_tmap = return_dict[ref_label]
+                    new_blocks: List[TensorBlock] = []
+                    for block_key, ref_block in ref_tmap.items():
+                        head_vals: List[torch.Tensor] = []
+                        for label in self.uafd_head_labels:
+                            head_vals.append(
+                                return_dict[label].block(block_key).values
+                            )
+                        combined = torch.zeros_like(head_vals[0])
+                        for i in range(len(self.uafd_weights_list)):
+                            combined = (
+                                combined + self.uafd_weights_list[i] * head_vals[i]
+                            )
+                        new_blocks.append(
+                            TensorBlock(
+                                values=combined,
+                                samples=ref_block.samples,
+                                components=ref_block.components,
+                                properties=ref_block.properties,
+                            )
+                        )
+                    uafd_tmap = TensorMap(ref_tmap.keys, new_blocks)
+                    if outputs["energy/weighted_sum"].sample_kind != "atom":
+                        uafd_tmap = sum_over_atoms(uafd_tmap)
+                    return_dict["energy/weighted_sum"] = uafd_tmap
 
         return return_dict
 
