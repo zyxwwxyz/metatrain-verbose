@@ -550,11 +550,15 @@ class PET(ModelInterface[ModelHypers]):
         # UAFD: when the weighted-sum output is requested, silently ensure
         # that each constituent head label is also computed during this pass
         # (per-atom, so the values can be combined before summing over atoms).
+        # Work on a local copy so the caller's dict is never mutated.
+        uafd_injected_labels: List[str] = []
         if self.use_uafd_head_weighted_sum and "energy/weighted_sum" in outputs:
+            outputs = dict(outputs)
             for i in range(len(self.uafd_head_labels)):
                 label = self.uafd_head_labels[i]
                 if label not in outputs:
                     outputs[label] = self.uafd_head_model_outputs[i]
+                    uafd_injected_labels.append(label)
 
         if self.single_label.values.device != device:
             self._move_labels_to_device(device)
@@ -838,8 +842,8 @@ class PET(ModelInterface[ModelHypers]):
                             head_vals.append(
                                 return_dict[label].block(block_key).values
                             )
-                        combined = torch.zeros_like(head_vals[0])
-                        for i in range(len(self.uafd_weights_list)):
+                        combined = self.uafd_weights_list[0] * head_vals[0]
+                        for i in range(1, len(self.uafd_weights_list)):
                             combined = (
                                 combined + self.uafd_weights_list[i] * head_vals[i]
                             )
@@ -855,6 +859,8 @@ class PET(ModelInterface[ModelHypers]):
                     if outputs["energy/weighted_sum"].sample_kind != "atom":
                         uafd_tmap = sum_over_atoms(uafd_tmap)
                     return_dict["energy/weighted_sum"] = uafd_tmap
+                    for label in uafd_injected_labels:
+                        del return_dict[label]
 
         return return_dict
 
