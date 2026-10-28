@@ -903,6 +903,12 @@ class FlashMDSymplectic(ModelInterface):
             base_name = output_name.replace("mtt::aux::", "").replace(
                 "_last_layer_features", ""
             )
+            if base_name in ["position", "momentum"]:
+                raise ValueError(
+                    f"'{output_name}' is not available: '{base_name}' is computed "
+                    "from the derivatives of 'mtt::S3', so it has no last-layer "
+                    "features of its own (only 'mtt::S3' has them)."
+                )
             # the corresponding output could be base_name or mtt::base_name
             if f"mtt::{base_name}" in last_layer_features_dict:
                 base_name = f"mtt::{base_name}"
@@ -1277,11 +1283,15 @@ class FlashMDSymplectic(ModelInterface):
             ]
         )
 
-        ll_features_name = get_last_layer_features_name(target_name)
-        # shared by all the blocks of the target
-        self.outputs[ll_features_name] = get_features_info(
-            self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
-        )
+        # position and momentum are the derivatives of mtt::S3, so the predictions
+        # of their own heads are discarded (and these heads are never trained): they
+        # have no meaningful last-layer features
+        if target_name not in ["position", "momentum"]:
+            ll_features_name = get_last_layer_features_name(target_name)
+            # shared by all the blocks of the target
+            self.outputs[ll_features_name] = get_features_info(
+                self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
+            )
         self.key_labels[target_name] = target_info.layout.keys
         self.component_labels[target_name] = [
             block.components for block in target_info.layout.blocks()
